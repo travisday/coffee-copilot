@@ -1,0 +1,12 @@
+.venv/
+.mplconfig/
+notebooks/.mplconfig/
+.env
+data/store.db
+data/store.db-shm
+data/store.db-wal
+__pycache__/
+.langgraph_api/
+.claude/
+.pytest_cache/
+.DS_Store

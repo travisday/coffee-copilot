@@ -1,0 +1,25 @@
+# EDA notebook + plan stack baseline
+pandas>=2.2
+numpy
+matplotlib
+matplotlib-inline
+seaborn
+plotly
+ipython
+nbformat
+ipykernel
+
+# Model layer
+statsmodels
+scipy
+scikit-learn
+
+# Agent + LLM
+langgraph
+langchain
+langchain-openai
+langsmith
+python-dotenv
+
+# App
+streamlit
