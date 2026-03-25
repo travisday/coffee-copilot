@@ -184,6 +184,28 @@ def get_overrides_for_context(
     return [dict(r) for r in rows]
 
 
+def get_recent_overrides(
+    *,
+    limit: int = 20,
+    db_path: str | Path = DEFAULT_DB_PATH,
+) -> list[dict[str, Any]]:
+    """Return the most recent overrides across all machines/windows (last 30 days).
+
+    Used to inject override context into the conversation so the agent
+    is aware of past user adjustments even before calling forecast_demand.
+    """
+    conn = _connect(db_path)
+    rows = conn.execute(
+        "SELECT machine_id, hour_window, product, original_rec, adjusted_rec, reason, date "
+        "FROM user_overrides "
+        "WHERE timestamp >= datetime('now', '-30 days') "
+        "ORDER BY timestamp DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
 # ── User feedback ───────────────────────────────────────────────────
 
 def save_feedback(

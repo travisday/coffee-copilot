@@ -33,8 +33,15 @@ BUCKET_BOUNDS: dict[str, tuple[int, int]] = {
     "18-21": (18, 21),
 }
 
-GUARDRAIL_FACTOR = 1.5       # cap at historical max × this
 TRAIN_FRACTION = 0.80        # time-based split on Machine 1 dates
+
+
+def bucket_label(hb: str) -> str:
+    """Convert a bucket key like ``'06-09'`` to ``'06:00–09:00'``."""
+    parts = hb.split("-")
+    if len(parts) != 2:
+        return hb
+    return f"{parts[0]}:00–{parts[1]}:00"
 
 
 def _map_hour_bucket(hour: int) -> str:
@@ -51,7 +58,7 @@ def _map_hour_bucket(hour: int) -> str:
     return "outside"
 
 
-def _overlapping_buckets(hour_start: int, hour_end: int) -> list[str]:
+def overlapping_buckets(hour_start: int, hour_end: int) -> list[str]:
     """Return the hour_bucket labels that overlap [hour_start, hour_end)."""
     buckets: list[str] = []
     for label, (lo, hi) in BUCKET_BOUNDS.items():
@@ -452,9 +459,11 @@ class DemandForecaster:
         }
 
     @staticmethod
-    def confidence_label(machine_id: str, n_buckets: int) -> str:
+    def confidence_label(machine_id: str, n_buckets: int, plan_scope: str = "window") -> str:
         if machine_id == "machine_2":
             return "Rough estimate (limited Machine 2 data)"
+        if plan_scope == "day":
+            return "Confident"
         if n_buckets > 2:
             return "Less certain (summed across many windows)"
         return "Confident"

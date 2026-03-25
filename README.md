@@ -27,6 +27,8 @@ flowchart TD
     Tools --> Model[Poisson GLM + Product Mix]
 ```
 
+
+
 The system has four layers. Each one is a deliberate choice.
 
 ### Agent Layer (`agent/`)
@@ -34,8 +36,6 @@ The system has four layers. Each one is a deliberate choice.
 The agent uses LangGraph's `create_react_agent` (ReAct pattern) with GPT-4o at temperature 0.
 
 **Why ReAct over a fixed pipeline.** The manager's questions range from "plan tomorrow" to "compare the two machines" to "how accurate is the model." A fixed pipeline would need separate routes for each. ReAct lets the LLM reason about which tools to call and how to compose the results into a natural answer.
-
-**Why GPT-4o.** It handles structured tool calls reliably, follows the system prompt's framing rules (lead with action, not math), and stays within the "you support, the manager decides" guardrail.
 
 **System prompt design** (`agent/prompts.py`). The prompt establishes a few principles that shape every response. The agent leads with recommendations, not model internals ("I'd suggest stocking X" not "the model predicts lambda=2.8"). It flags uncertainty honestly, especially for Machine 2's sparse data. It references past overrides when they exist ("you bumped Lattes up last time for this window"). And it distinguishes between `day` scope (full-day minimum inventory floors) and `window` scope (top-up guide for a specific time range).
 
@@ -45,10 +45,10 @@ The agent uses LangGraph's `create_react_agent` (ReAct pattern) with GPT-4o at t
 
 Four tools, each with a clear purpose:
 
-- **`forecast_demand`** is the core tool. It takes a date, scope (day or window), time range, and safety level. It always returns both machines so the UI can render overrides for each. Internally it calls the model, converts the continuous rate to a discrete planning bound, splits by product mix, assigns demand tiers, and attaches any past overrides from the database.
-- **`get_sales_summary`** handles historical questions ("best sellers last month," "busiest times"). Groups by product, daypart, day of week, or machine.
-- **`get_revenue_insights`** surfaces business opportunities by analyzing revenue patterns across dayparts and product mix.
-- **`get_model_insights`** explains the model itself, returning coefficients (demand trend, machine comparison, time-of-day effects) and accuracy metrics (MAE, prediction-interval coverage). Used when the manager asks "why" or "how accurate."
+- `**forecast_demand`** is the core tool. It takes a date, scope (day or window), time range, safety level, and an optional `machine_id`. It always returns data for both machines, but when `machine_id` is set the response includes a `focus_machines` key that tells the UI to only render override sliders for the requested machine. Internally it calls the model, converts the continuous rate to a discrete planning bound, splits by product mix, assigns demand tiers, and attaches any past overrides from the database.
+- `**get_sales_summary**` handles historical questions ("best sellers last month," "busiest times"). Groups by product, daypart, day of week, or machine.
+- `**get_revenue_insights**` surfaces business opportunities by analyzing revenue patterns across dayparts and product mix.
+- `**get_model_insights**` explains the model itself, returning coefficients (demand trend, machine comparison, time-of-day effects) and accuracy metrics (MAE, prediction-interval coverage). Used when the manager asks "why" or "how accurate."
 
 ### Model Layer (`models/`)
 
@@ -70,7 +70,7 @@ The UI is a Streamlit chat interface with four layers of interaction per respons
 
 **Transparency ("Why this recommendation").** A collapsible expander shows the math in plain language. Model prediction (average rate), planning upper bound (percentile), per-product breakdown with mix shares, confidence labels. The goal is to let the manager understand the reasoning without requiring them to ask.
 
-**Override sliders.** Every product gets an inline slider initialized to the model's recommendation, or to the manager's last adjustment for that machine and window if one exists. If sliders are changed, confirming triggers a dialog asking *why* (optional free text). This serves two purposes: the reason is stored for the agent to reference next time, and it creates an audit trail. If sliders match the model, confirming is a single click with no dialog.
+**Override sliders.** Every product gets an inline slider initialized to the model's recommendation, or to the manager's last adjustment for that machine and window if one exists. Sliders are scoped to the machine(s) the user asked about — asking "plan Machine 1" shows only Machine 1's sliders, while "plan tomorrow" shows both. If sliders are changed, confirming triggers a dialog asking *why* (optional free text). This serves two purposes: the reason is stored for the agent to reference next time, and it creates an audit trail. If sliders match the model, confirming is a single click with no dialog.
 
 **Feedback.** Thumbs up/down on every response. Thumbs down opens a comment dialog ("forecasts feel too low," "too much math detail"). Recent negative comments are injected into the next agent call so the agent can self-correct its framing.
 
@@ -80,9 +80,9 @@ The UI is a Streamlit chat interface with four layers of interaction per respons
 
 SQLite with three tables:
 
-- **`conversation_history`** stores all messages with metadata (tool calls, forecast data) so the chat survives page refreshes.
-- **`user_overrides`** stores every slider adjustment keyed by machine, hour window, product, and date. The forecast tool queries the last 30 days of overrides for the same machine and window, passing them to the agent so it can say "you bumped Lattes last Tuesday."
-- **`user_feedback`** stores thumbs up/down and optional comments. Negative feedback with comments is injected into future agent calls.
+- `**conversation_history`** stores all messages with metadata (tool calls, forecast data) so the chat survives page refreshes.
+- `**user_overrides**` stores every slider adjustment keyed by machine, hour window, product, and date. The forecast tool queries the last 30 days of overrides for the same machine and window, passing them to the agent so it can say "you bumped Lattes last Tuesday."
+- `**user_feedback**` stores thumbs up/down and optional comments. Negative feedback with comments is injected into future agent calls.
 
 Tool-call observability is delegated to LangSmith rather than duplicated in SQLite.
 
@@ -121,7 +121,11 @@ langgraph.json          LangGraph dev server config
 ## Assumptions
 
 - Copilot outputs are **minimum inventory levels**, target floors for each product. Not exact production or one-shot fill orders. The manager can restock multiple times per day.
-- Each machine's slot budget for full-day plans is clamped to the number of products in the recommendation set (8 for both machines in the MVP). Machine 2 has 30 distinct SKUs in the dataset but sparse data, so recommendations are scoped to Machine 1's proven 8-product set.
+- **Products are independent SKUs.** A Latte and an Espresso are separate items even though a latte contains espresso. The system has no concept of shared ingredients, bills of materials, or raw-input inventory (beans, milk, cups). Recommendations are finished-drink counts, not ingredient quantities.
+- **No demand substitution.** If Lattes stock out, the model does not assume customers switch to Cappuccinos. Each product's demand is modeled independently via its historical mix share.
+- **Machines are independent.** Demand at Machine 1 does not influence Machine 2's forecast. If one machine goes offline, the model does not redistribute its expected volume to the other.
+- **Demand across time windows is independent.** Selling more drinks in the morning does not reduce or increase the afternoon forecast. Each 3-hour bucket is predicted separately.
+- **Recommendations cover Machine 1's 8-product set for both machines.** Machine 2 has 30 distinct SKUs in the dataset but most have near-zero sales. Rather than generate unreliable recommendations for rarely-sold products, the system uses Machine 1's 8 proven products as the recommendation set for both machines. The actual machines may stock more products than the copilot recommends for.
 - Products do not expire within the planning window.
 - Timestamps are in each machine's local time, compared directly without timezone conversion.
 - Two vending machines identified by source file (`index_1.csv` = Machine 1, `index_2.csv` = Machine 2).
@@ -137,3 +141,4 @@ langgraph.json          LangGraph dev server config
 - No external features (weather, holidays, local events).
 - No real-time data pipeline. Model trains on static CSV at startup.
 - Override history is captured and surfaced to the agent but not connected to automated model retraining.
+

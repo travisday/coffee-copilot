@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 from typing import Any
 
 import pandas as pd
 import streamlit as st
+
+from models.forecaster import bucket_label
 
 _LOG = logging.getLogger("coffee_copilot.ui.forecast")
 
@@ -37,6 +38,9 @@ def normalize_forecast_data(data: dict | None) -> dict | None:
     unknown_blocks: list[dict[str, Any]] = []
 
     for k, v in data.items():
+        if k == "focus_machines":
+            out["focus_machines"] = v
+            continue
         if not isinstance(v, dict):
             continue
         canon = _canonical_machine_key(k)
@@ -78,14 +82,6 @@ def iter_forecast_machines(forecast_data: dict):
             yield mid, data
 
 
-def _bucket_label(bucket: str) -> str:
-    m = re.match(r"^(\d{2})-(\d{2})$", bucket.strip())
-    if not m:
-        return bucket
-    h1, h2 = int(m.group(1)), int(m.group(2))
-    return f"{h1:02d}:00–{h2:02d}:00"
-
-
 def _pct(x: float) -> str:
     return f"{100.0 * float(x):.0f}%"
 
@@ -95,14 +91,14 @@ def _safety_sentence(percentile: float, plan_scope: str | None) -> str:
     scope = (plan_scope or "window").lower()
     if scope == "day":
         return (
-            f"Minimum levels start from a **{p}th percentile** cap on **full-day** "
-            "expected total drinks, split by overall mix, then scaled so the **sum of "
-            "floors matches each machine's slot budget** (one slot per distinct "
-            "product ever sold on that machine in the dataset)."
+            f"Stocking targets use a **{p}th percentile** cap on **full-day** "
+            "expected total drinks, split proportionally across products by "
+            "historical sales mix."
         )
     return (
-        f"Levels for this window use a **{p}th percentile** cap on expected drinks "
-        "in that period (higher = more buffer). Change the safety level in the sidebar."
+        f"Stocking targets for this window use a **{p}th percentile** cap on expected "
+        "drinks in that period, split proportionally across products by time-specific "
+        "sales mix (higher = more buffer). Change the safety level in the sidebar."
     )
 
 
@@ -127,8 +123,8 @@ def _render_forecast_demand_explained(tc: dict, forecast_data: dict | None) -> N
             f"- **Date:** {target}  \n"
             f"- **Scope:** Full business day (06:00–21:00), all 3-hour buckets summed  \n"
             f"- **Safety level:** {safety}  \n"
-            f"- **Slot budget (per machine):** distinct products ever sold on that machine "
-            f"(see each machine block below)"
+            f"- **Stocking target:** total forecasted demand at the chosen safety level, "
+            f"split proportionally across products"
         )
     else:
         win = (
@@ -152,7 +148,7 @@ def _render_forecast_demand_explained(tc: dict, forecast_data: dict | None) -> N
         _, d0 = first
         buckets = d0.get("buckets_used") or []
         if buckets:
-            bl = ", ".join(_bucket_label(b) for b in buckets)
+            bl = ", ".join(bucket_label(b) for b in buckets)
             if plan_scope == "day":
                 st.markdown(
                     f"Volume is summed across **all business 3-hour buckets** for the day: {bl}."
@@ -191,16 +187,11 @@ def _render_forecast_demand_explained(tc: dict, forecast_data: dict | None) -> N
                 "Product mix for this machine uses Machine 1’s historical mix — "
                 "you know local preferences better."
             )
-        if plan_scope == "day" and d.get("machine_slot_capacity") is not None:
-            if d.get("capacity_basis") == "unique_products_sold":
-                st.caption(
-                    f"Slot budget: **{d['machine_slot_capacity']}** (one per distinct "
-                    "product ever sold on this machine)."
-                )
-            else:
-                st.caption(
-                    f"Daily minimum levels are scaled to **{d['machine_slot_capacity']}** total slots."
-                )
+        if plan_scope == "day" and d.get("total_volume_upper") is not None:
+            st.caption(
+                f"Total stocking target: **{d['total_volume_upper']}** units "
+                f"(forecasted demand at {d.get('safety_percentile', 0.9):.0%} safety level)."
+            )
         cn = d.get("capacity_note")
         if cn:
             st.warning(str(cn))
@@ -215,9 +206,9 @@ def _render_forecast_demand_explained(tc: dict, forecast_data: dict | None) -> N
     st.markdown(_safety_sentence(safety_pct, plan_scope))
 
     st.markdown(
-        "**Minimum inventory levels (upper bound × mix, then rules above)**"
+        "**Stocking recommendations (upper bound × mix, proportional split)**"
         if plan_scope == "day"
-        else "**Minimum levels for this window (upper bound × mix)**"
+        else "**Stocking recommendations for this window (upper bound × time-specific mix)**"
     )
     rows = []
     for mid, d in iter_forecast_machines(fd):
@@ -228,7 +219,7 @@ def _render_forecast_demand_explained(tc: dict, forecast_data: dict | None) -> N
             row = {
                 "Machine": mlabel,
                 "Product": r.get("product", "—"),
-                "Min. level": r.get("recommended_stock", "—"),
+                "Rec. stock": r.get("recommended_stock", "—"),
                 "Expected (fractional)": r.get("expected_demand", "—"),
                 "Share of mix": pct_s,
                 "Note": r.get("confidence", ""),
@@ -343,7 +334,7 @@ def render_why_this_recommendation(
 
     with st.expander("Why this recommendation"):
         st.caption(
-            "How we estimated volume, uncertainty, and minimum inventory levels per "
+            "How we estimated volume, uncertainty, and stocking recommendations per "
             "product — without spreadsheet jargon."
         )
         for i, tc in enumerate(tool_calls):

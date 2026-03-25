@@ -1,7 +1,7 @@
 """LangGraph tools for the coffee ops copilot.
 
 Four tools wrapping DemandForecaster and RevenueAnalyzer:
-- forecast_demand: volume forecast + minimum-inventory levels (daily or window scope)
+- forecast_demand: volume forecast + stocking recommendations (daily or window scope)
 - get_sales_summary: historical sales aggregations
 - get_revenue_insights: daypart performance and product mix analysis
 - get_model_insights: explain how the forecasting model works and its accuracy
@@ -21,15 +21,16 @@ from models.forecaster import (
     DemandForecaster,
     allocate_daily_minimum_levels,
     assign_demand_tiers,
-    _overlapping_buckets,
+    bucket_label,
+    overlapping_buckets,
 )
 from models.analyzer import RevenueAnalyzer
 from db import get_overrides_for_context
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
-_forecaster = DemandForecaster(DATA_DIR)
-_analyzer = RevenueAnalyzer(_forecaster.raw_data)
+forecaster = DemandForecaster(DATA_DIR)
+_analyzer = RevenueAnalyzer(forecaster.raw_data)
 
 SAFETY_LEVELS: dict[str, float] = {
     "conservative": 0.95,
@@ -57,13 +58,6 @@ DAY_PLAN_HOUR_WINDOW = "full day (06:00–21:00)"
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _bucket_label(hb: str) -> str:
-    parts = hb.split("-")
-    if len(parts) != 2:
-        return hb
-    return f"{parts[0]}:00–{parts[1]}:00"
-
-
 def _peak_summary_lines(
     peak_map: dict[str, str],
     top_products: list[str],
@@ -73,7 +67,7 @@ def _peak_summary_lines(
     for p in top_products[:limit]:
         hb = peak_map.get(p)
         if hb:
-            lines.append(f"{p}: busiest in {_bucket_label(hb)}")
+            lines.append(f"{p}: busiest in {bucket_label(hb)}")
     return lines
 
 
@@ -84,29 +78,24 @@ def _machine_block_day(
 ) -> dict[str, Any]:
     dt = pd.Timestamp(target_date)
     buckets = BUSINESS_HOUR_BUCKETS
-    volume = _forecaster.predict_volume(target_date, buckets)
+    volume = forecaster.predict_volume(target_date, buckets)
 
     total_mean = sum(volume[mid][b]["mean"] for b in buckets)
     total_upper = int(poisson.ppf(percentile, total_mean)) if total_mean > 0 else 0
 
-    machine_slot_capacity = _forecaster.slot_capacity_for_machine(mid)
-
-    props = _forecaster.global_mix_proportions_machine_1()
-    products = _forecaster.machine_1_product_names()
-    machine_slot_capacity = min(machine_slot_capacity, len(products))
+    props = forecaster.global_mix_proportions_machine_1()
+    products = forecaster.machine_1_product_names()
     if not products:
         return {
             "date": target_date,
             "day_of_week": dt.day_name(),
             "plan_scope": "day",
-            "framing": "minimum_inventory_levels",
+            "framing": "stocking_recommendations",
             "hour_window": DAY_PLAN_HOUR_WINDOW,
             "buckets_used": buckets,
             "total_volume_mean": round(total_mean, 2),
             "total_volume_upper": total_upper,
             "safety_percentile": percentile,
-            "machine_slot_capacity": machine_slot_capacity,
-            "capacity_basis": "unique_products_sold",
             "capacity_note": None,
             "recommendations": [],
             "recommendations_by_tier": {"high": [], "moderate": [], "keep_stocked": []},
@@ -123,11 +112,11 @@ def _machine_block_day(
     levels, cap_note = allocate_daily_minimum_levels(
         products,
         expected,
-        machine_slot_capacity,
-        min_floor=1,
+        total_upper,
+        min_floor=0,
     )
     tiers_map = assign_demand_tiers(products, expected)
-    peak_bucket = _forecaster.peak_hour_bucket_per_product()
+    peak_bucket = forecaster.peak_hour_bucket_per_product()
 
     recs: list[dict[str, Any]] = []
     by_tier: dict[str, list[dict[str, Any]]] = {
@@ -139,11 +128,11 @@ def _machine_block_day(
         tier = tiers_map.get(p, "keep_stocked")
         row = {
             "product": p,
-            "recommended_stock": int(levels.get(p, 1)),
+            "recommended_stock": int(levels.get(p, 0)),
             "expected_demand": float(expected.get(p, 0.0)),
             "proportion": round(props.get(p, 0.0), 4),
             "demand_tier": tier,
-            "confidence": DemandForecaster.confidence_label(mid, len(buckets)),
+            "confidence": DemandForecaster.confidence_label(mid, len(buckets), plan_scope="day"),
         }
         recs.append(row)
         by_tier[tier].append(row)
@@ -155,14 +144,12 @@ def _machine_block_day(
         "date": target_date,
         "day_of_week": dt.day_name(),
         "plan_scope": "day",
-        "framing": "minimum_inventory_levels",
+        "framing": "stocking_recommendations",
         "hour_window": DAY_PLAN_HOUR_WINDOW,
         "buckets_used": buckets,
         "total_volume_mean": round(total_mean, 2),
         "total_volume_upper": total_upper,
         "safety_percentile": percentile,
-        "machine_slot_capacity": machine_slot_capacity,
-        "capacity_basis": "unique_products_sold",
         "capacity_note": cap_note,
         "recommendations": recs,
         "recommendations_by_tier": by_tier,
@@ -180,16 +167,19 @@ def _machine_block_window(
     percentile: float,
 ) -> dict[str, Any]:
     dt = pd.Timestamp(target_date)
-    buckets = _overlapping_buckets(start_hour, end_hour)
-    volume = _forecaster.predict_volume(target_date, buckets)
+    buckets = overlapping_buckets(start_hour, end_hour)
+    volume = forecaster.predict_volume(target_date, buckets)
 
     total_mean = sum(volume[mid][b]["mean"] for b in buckets)
     total_upper = int(poisson.ppf(percentile, total_mean)) if total_mean > 0 else 0
 
-    machine_slot_capacity = _forecaster.slot_capacity_for_machine(mid)
-    props = _forecaster.global_mix_proportions_machine_1()
-    products = _forecaster.machine_1_product_names()
-    machine_slot_capacity = min(machine_slot_capacity, len(products))
+    mix_result = forecaster.get_merged_mix(buckets, mid)
+    props = mix_result["proportions"]
+    is_mix_fallback = mix_result["fallback"]
+    if not props:
+        props = forecaster.global_mix_proportions_machine_1()
+        is_mix_fallback = True
+    products = forecaster.machine_1_product_names()
     hour_window = f"{start_hour:02d}:00-{end_hour:02d}:00"
 
     if not products:
@@ -197,20 +187,18 @@ def _machine_block_window(
             "date": target_date,
             "day_of_week": dt.day_name(),
             "plan_scope": "window",
-            "framing": "minimum_inventory_levels",
+            "framing": "stocking_recommendations",
             "hour_window": hour_window,
             "buckets_used": buckets,
             "total_volume_mean": round(total_mean, 2),
             "total_volume_upper": total_upper,
             "safety_percentile": percentile,
-            "machine_slot_capacity": machine_slot_capacity,
-            "capacity_basis": "unique_products_sold",
             "capacity_note": None,
             "recommendations": [],
             "recommendations_by_tier": {"high": [], "moderate": [], "keep_stocked": []},
             "peak_demand_hints": [],
             "window_mode_cta": WINDOW_MODE_CTA,
-            "mix_fallback": mid == "machine_2",
+            "mix_fallback": is_mix_fallback,
             "past_adjustments": get_overrides_for_context(mid, hour_window),
         }
 
@@ -222,11 +210,11 @@ def _machine_block_window(
     levels, cap_note = allocate_daily_minimum_levels(
         products,
         expected,
-        machine_slot_capacity,
-        min_floor=1,
+        total_upper,
+        min_floor=0,
     )
     tiers_map = assign_demand_tiers(products, expected)
-    peak_bucket = _forecaster.peak_hour_bucket_per_product()
+    peak_bucket = forecaster.peak_hour_bucket_per_product()
 
     recs: list[dict[str, Any]] = []
     by_tier: dict[str, list[dict[str, Any]]] = {
@@ -238,11 +226,11 @@ def _machine_block_window(
         tier = tiers_map.get(p, "keep_stocked")
         row = {
             "product": p,
-            "recommended_stock": int(levels.get(p, 1)),
+            "recommended_stock": int(levels.get(p, 0)),
             "expected_demand": float(expected.get(p, 0.0)),
             "proportion": round(props.get(p, 0.0), 4),
             "demand_tier": tier,
-            "confidence": DemandForecaster.confidence_label(mid, len(buckets)),
+            "confidence": DemandForecaster.confidence_label(mid, len(buckets), plan_scope="window"),
         }
         recs.append(row)
         by_tier[tier].append(row)
@@ -254,20 +242,18 @@ def _machine_block_window(
         "date": target_date,
         "day_of_week": dt.day_name(),
         "plan_scope": "window",
-        "framing": "minimum_inventory_levels",
+        "framing": "stocking_recommendations",
         "hour_window": hour_window,
         "buckets_used": buckets,
         "total_volume_mean": round(total_mean, 2),
         "total_volume_upper": total_upper,
         "safety_percentile": percentile,
-        "machine_slot_capacity": machine_slot_capacity,
-        "capacity_basis": "unique_products_sold",
         "capacity_note": cap_note,
         "recommendations": recs,
         "recommendations_by_tier": by_tier,
         "peak_demand_hints": peak_hints,
         "window_mode_cta": WINDOW_MODE_CTA,
-        "mix_fallback": mid == "machine_2",
+        "mix_fallback": is_mix_fallback,
         "past_adjustments": get_overrides_for_context(mid, hour_window),
     }
 
@@ -282,28 +268,25 @@ def forecast_demand(
     plan_scope: str = "window",
     start_hour: int = 6,
     end_hour: int = 21,
-    machine_id: str | None = None,
     safety_level: str = "normal",
+    machine_id: str | None = None,
 ) -> dict[str, Any]:
-    """Forecast demand and minimum inventory levels for a future day or time window.
+    """Forecast demand and stocking recommendations for a future day or time window.
 
-    Use plan_scope \"day\" for full-day minimum inventory floors (default for broad
+    Use plan_scope \"day\" for full-day stocking recommendations (default for broad
     questions like \"plan tomorrow\" or \"stock Machine 1\"). Use \"window\" when the
     user gives a specific time range (e.g. 7--10am). Always returns both machines.
 
-    Daily mode scales total minimum levels to each machine's **slot capacity**, which
-    is the number of **distinct products ever sold** on that machine in the dataset.
-
     Args:
         target_date: ISO date string (e.g. \"2024-10-07\")
-        plan_scope: \"day\" = full business day (06--21) minimum levels; \
-\"window\" = top-up guide for [start_hour, end_hour).
+        plan_scope: \"day\" = full business day (06--21) stocking recommendations; \
+\"window\" = time-range recommendations for [start_hour, end_hour).
         start_hour: Window start (only used when plan_scope is \"window\")
         end_hour: Window end (only used when plan_scope is \"window\")
-        machine_id: Deprecated — both machines are always returned.
         safety_level: \"conservative\", \"normal\", or \"lean\"
+        machine_id: \"machine_1\" or \"machine_2\" to focus the UI on one machine, \
+or omit/null for both. Data is always returned for both machines.
     """
-    _ = machine_id
     percentile = SAFETY_LEVELS.get(safety_level, 0.90)
     scope = (plan_scope or "window").strip().lower()
     if scope not in ("day", "window"):
@@ -318,6 +301,11 @@ def forecast_demand(
             result[mid] = _machine_block_window(
                 mid, target_date, start_hour, end_hour, percentile,
             )
+
+    if machine_id and machine_id in result:
+        result["focus_machines"] = [machine_id]
+    else:
+        result["focus_machines"] = list(k for k in result if k in machines)
 
     return result
 
@@ -340,7 +328,7 @@ def get_sales_summary(
         machine_id: "machine_1", "machine_2", or omit for both
         group_by: "product", "daypart", "day_of_week", or "machine"
     """
-    df = _forecaster.raw_data.copy()
+    df = forecaster.raw_data.copy()
     start = pd.Timestamp(start_date).date()
     end = pd.Timestamp(end_date).date()
     df = df.loc[(df["sale_date"] >= start) & (df["sale_date"] <= end)]
@@ -410,8 +398,8 @@ def get_model_insights() -> dict[str, Any]:
     set size). Use when the manager asks "why", "how accurate", or
     "how does the model work".
     """
-    coefficients = _forecaster.get_coefficients_summary()
-    metrics = _forecaster.eval_metrics
+    coefficients = forecaster.get_coefficients_summary()
+    metrics = forecaster.eval_metrics
     return {
         "coefficients": coefficients,
         "eval_metrics": metrics,
