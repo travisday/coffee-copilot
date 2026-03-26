@@ -17,6 +17,7 @@ scikit-learn
 # Agent + LLM
 langgraph
 langchain
+langchain-core
 langchain-openai
 langsmith
 python-dotenv
